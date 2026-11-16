@@ -91,6 +91,14 @@ class HotspotPreferences(private val context: Context) {
         context.dataStore.edit { it[Keys.NOTIF_DISMISSED] = true }
     }
 
+    suspend fun getLastAdminNotificationId(): Int {
+        return context.dataStore.data.first()[Keys.LAST_ADMIN_NOTIF_ID] ?: 0
+    }
+
+    suspend fun setLastAdminNotificationId(id: Int) {
+        context.dataStore.edit { it[Keys.LAST_ADMIN_NOTIF_ID] = id }
+    }
+
     suspend fun getCardQuotaState(cardId: String): CardQuotaState {
         val safeId = cardId.ifBlank { "default_card" }
         val prefs = context.dataStore.data.first()
@@ -159,12 +167,11 @@ class HotspotPreferences(private val context: Context) {
         }
         return arr.toString()
     }
-
-    suspend fun getLastAdminNotificationId(): Int {
-        return context.dataStore.data.first()[Keys.LAST_ADMIN_NOTIF_ID] ?: 0
-    }
-
-    suspend fun setLastAdminNotificationId(id: Int) {
-        context.dataStore.edit { it[Keys.LAST_ADMIN_NOTIF_ID] = id }
-    }
 }
+
+data class CardQuotaState(
+    val maxBytes: Double,
+    val maxSecs: Long,
+    val alert30Sent: Boolean,
+    val alert15Sent: Boolean
+)
