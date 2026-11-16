@@ -26,10 +26,8 @@ class NetworkSyncWorker(
         val hotspotRepo = HotspotRepository()
         val notifier = QuotaNotifier(applicationContext)
 
-        // 1. Sync dynamic profile mappings from Admin Server (works inside Walled Garden)
         remoteRepo.fetchConfig()
 
-        // 2. Poll local admin broadcast notifications for connected users
         val lastNotifId = prefs.getLastAdminNotificationId()
         val newNotifs = remoteRepo.fetchNewNotifications(afterId = lastNotifId)
         if (newNotifs.isNotEmpty()) {
@@ -48,10 +46,9 @@ class NetworkSyncWorker(
             prefs.setLastAdminNotificationId(maxId)
         }
 
-        // 3. Check current hotspot session quota for 30% / 15% alerts in background
         val status = hotspotRepo.fetchStatus(fastProbe = true, closeConnection = true)
         if (status is StatusFetchResult.Connected && !status.session.isProvisional) {
-            val quotaState = prefs.getQuotaState(status.session.username)
+            val quotaState = prefs.getCardQuotaState(status.session.username)
             val analysis = MikrotikParser.analyzeQuota(
                 session = status.session,
                 savedMaxBytes = quotaState.maxBytes,
@@ -64,8 +61,8 @@ class NetworkSyncWorker(
             } else if (analysis.shouldFireNotification30) {
                 notifier.notifyQuota30(analysis.summaryText)
             }
-            prefs.saveQuotaState(
-                username = status.session.username,
+            prefs.updateCardQuotaState(
+                cardId = status.session.username,
                 maxBytes = analysis.updatedMaxBytes,
                 maxSecs = analysis.updatedMaxSecs,
                 alert30Sent = analysis.alert30Sent,
