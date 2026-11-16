@@ -65,7 +65,7 @@ sealed interface UiEvent {
 class HotspotViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = HotspotPreferences(application.applicationContext)
-    private val repository = HotspotRepository()
+    private val repository = HotspotRepository(application.applicationContext)
     private val remoteRepo = RemoteConfigRepository()
     private val notifier = QuotaNotifier(application.applicationContext)
 
