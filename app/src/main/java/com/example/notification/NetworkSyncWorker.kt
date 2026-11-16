@@ -5,6 +5,7 @@ import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
@@ -28,12 +29,7 @@ class NetworkSyncWorker(
 
         remoteRepo.fetchConfig()
 
-        val lastNotifId = prefs.getLastAdminNotificationId()
-        val newNotifs = remoteRepo.fetchNewNotifications(afterId = lastNotifId)
-        if (newNotifs.isNotEmpty()) {
-            var maxId = lastNotifId
-            for (n in newNotifs) {
-                if (notifier.hasNotificationPermission()) {
+        if (notifier.hasNotificationPermission()) {
             val lastNotifId = prefs.getLastAdminNotificationId()
             val newNotifs = remoteRepo.fetchNewNotifications(afterId = lastNotifId)
             if (newNotifs.isNotEmpty()) {
@@ -87,6 +83,11 @@ class NetworkSyncWorker(
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
+
+            val immediate = OneTimeWorkRequestBuilder<NetworkSyncWorker>()
+                .setConstraints(constraints)
+                .build()
+            WorkManager.getInstance(context).enqueue(immediate)
 
             val request = PeriodicWorkRequestBuilder<NetworkSyncWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(constraints)
