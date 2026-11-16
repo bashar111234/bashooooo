@@ -66,6 +66,7 @@ class HotspotViewModel(application: Application) : AndroidViewModel(application)
 
     private val prefs = HotspotPreferences(application.applicationContext)
     private val repository = HotspotRepository()
+    private val remoteRepo = RemoteConfigRepository()
     private val notifier = QuotaNotifier(application.applicationContext)
 
     private val _uiState = MutableStateFlow(
@@ -84,6 +85,26 @@ class HotspotViewModel(application: Application) : AndroidViewModel(application)
             prefs.snapshotFlow.collect { snapshot ->
                 applyPrefsSnapshot(snapshot)
             }
+       viewModelScope.launch {
+          while (isActive) {
+              remoteRepo.fetchConfig()
+              if (notifier.hasNotificationPermission()) {
+                  val lastId = prefs.getLastAdminNotificationId()
+                  val newNotifs = remoteRepo.fetchNewNotifications(afterId = lastId)
+                  if (newNotifs.isNotEmpty()) {
+                      var maxId = lastId
+                      for (n in newNotifs) {
+                          if (n.title.isNotBlank() && n.body.isNotBlank()) {
+                              notifier.notifyAdminBroadcast(n.id, n.title, n.body, n.highPriority)
+                          }
+                          if (n.id > maxId) maxId = n.id
+                      }
+                      prefs.setLastAdminNotificationId(maxId)
+                  }
+              }
+              delay(10_000L)
+          }
+      }
         }
         checkInitialSession()
     }
