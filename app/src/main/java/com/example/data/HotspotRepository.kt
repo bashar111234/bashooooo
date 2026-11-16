@@ -76,7 +76,6 @@ class HotspotRepository {
         val activeClient = if (fastProbe) probeClient else client
         try {
             val timestamp = System.currentTimeMillis()
-            // Fast check via /api.json first if available
             val apiReqBuilder = Request.Builder()
                 .url("${PortalConstants.API_URL}?_check=$timestamp")
                 .header("Cache-Control", "no-store")
@@ -110,7 +109,6 @@ class HotspotRepository {
                 return@withContext StatusFetchResult.NetworkError(describeNetworkException(apiDnsFailure))
             }
 
-            // Full status.html fetch
             val statusReqBuilder = Request.Builder()
                 .url("${PortalConstants.STATUS_URL}?_poll=$timestamp")
                 .header("Cache-Control", "no-store")
@@ -140,8 +138,8 @@ class HotspotRepository {
     }
 
     private suspend fun fetchStatusWithRetry(
-        initialDelayMs: Long = 300L,
-        delaysMs: List<Long> = listOf(500L, 850L, 1250L)
+        initialDelayMs: Long = 600L,
+        delaysMs: List<Long> = listOf(800L, 1200L, 1800L, 2500L)
     ): StatusFetchResult {
         delay(initialDelayMs)
         var lastResult: StatusFetchResult = StatusFetchResult.NetworkError("تعذر الاتصال ببوابة الشبكة.")
@@ -197,49 +195,62 @@ class HotspotRepository {
                 .post(formBody)
                 .build()
 
-            client.newCall(postReq).execute().use { resp ->
-                val finalUrl = resp.request.url.toString()
-                val html = resp.body?.string().orEmpty()
+            var aloginConfirmed = false
+            var postException: IOException? = null
 
-                val parsedStatus = MikrotikParser.parseStatusHtml(html)
-                if (parsedStatus != null && parsedStatus.loggedIn) {
-                    return@withContext LoginAttemptResult.Success(parsedStatus)
+            try {
+                client.newCall(postReq).execute().use { resp ->
+                    val finalUrl = resp.request.url.toString()
+                    val html = resp.body?.string().orEmpty()
+
+                    val parsedStatus = MikrotikParser.parseStatusHtml(html)
+                    if (parsedStatus != null && parsedStatus.loggedIn) {
+                        return@withContext LoginAttemptResult.Success(parsedStatus)
+                    }
+
+                    if (MikrotikParser.isLoginPageHtml(html)) {
+                        val errChallenge = MikrotikParser.parseLoginChallenge(html)
+                        val errMsg = errChallenge.errorMessage
+                            ?: "لم يتم قبول رقم الكرت، يرجى التأكد من الرقم وحالة الشبكة."
+                        return@withContext LoginAttemptResult.RouterError(errMsg)
+                    }
+
+                    aloginConfirmed = MikrotikParser.isAloginPageHtml(html) ||
+                        finalUrl.contains("alogin", ignoreCase = true) ||
+                        finalUrl.contains("status", ignoreCase = true)
                 }
+            } catch (e: IOException) {
+                // MikroTik frequently resets the pre-auth socket right after accepting login
+                postException = e
+            }
 
-                if (MikrotikParser.isLoginPageHtml(html)) {
-                    val errChallenge = MikrotikParser.parseLoginChallenge(html)
-                    val errMsg = errChallenge.errorMessage
-                        ?: "لم يتم قبول رقم الكرت، يرجى التأكد من الرقم وحالة الشبكة."
-                    return@withContext LoginAttemptResult.RouterError(errMsg)
-                }
+            client.connectionPool.evictAll()
 
-                val aloginConfirmed = MikrotikParser.isAloginPageHtml(html) ||
-                    finalUrl.contains("alogin", ignoreCase = true) ||
-                    finalUrl.contains("status", ignoreCase = true)
-
-                // RouterOS resets pre-auth conntrack sockets right after login; evict stale pooled sockets
-                client.connectionPool.evictAll()
-
-                when (val followUp = fetchStatusWithRetry()) {
-                    is StatusFetchResult.Connected -> LoginAttemptResult.Success(followUp.session)
-                    is StatusFetchResult.NotLoggedIn -> {
-                        val msg = followUp.challenge?.errorMessage
-                            ?: "فشل تسجيل الدخول، تحقق من رقم الكرت وحاول مرة أخرى."
+            when (val followUp = fetchStatusWithRetry()) {
+                is StatusFetchResult.Connected -> LoginAttemptResult.Success(followUp.session)
+                is StatusFetchResult.NotLoggedIn -> {
+                    val msg = followUp.challenge?.errorMessage
+                        ?: if (postException != null) describeNetworkException(postException)
+                        else "فشل تسجيل الدخول، تحقق من رقم الكرت وحاول مرة أخرى."
+                    if (postException != null && followUp.challenge?.errorMessage == null) {
+                        LoginAttemptResult.NetworkError(msg)
+                    } else {
                         LoginAttemptResult.RouterError(msg)
                     }
-                    is StatusFetchResult.NetworkError -> {
-                        if (aloginConfirmed) {
-                            // MikroTik explicitly served alogin success; transition cleanly and sync live stats in background
-                            LoginAttemptResult.Success(
-                                SessionStatus(
-                                    loggedIn = true,
-                                    isProvisional = true,
-                                    username = trimmedCard
-                                )
+                }
+                is StatusFetchResult.NetworkError -> {
+                    if (aloginConfirmed) {
+                        LoginAttemptResult.Success(
+                            SessionStatus(
+                                loggedIn = true,
+                                isProvisional = true,
+                                username = trimmedCard
                             )
-                        } else {
-                            LoginAttemptResult.NetworkError(followUp.message)
-                        }
+                        )
+                    } else {
+                        LoginAttemptResult.NetworkError(
+                            postException?.let { describeNetworkException(it) } ?: followUp.message
+                        )
                     }
                 }
             }
@@ -269,7 +280,7 @@ class HotspotRepository {
                 .build()
 
             runCatching {
-                client.newCall(logoutReq).execute().use { /* complete logout */ }
+                client.newCall(logoutReq).execute().use { }
             }
             client.connectionPool.evictAll()
             delay(350)
@@ -279,97 +290,85 @@ class HotspotRepository {
         }
     }
 
-    suspend fun logout(
-        logoutUrl: String?,
-        currentSession: SessionStatus?
-    ): LogoutSummary = withContext(Dispatchers.IO) {
-        val secureLogout = MikrotikParser.ensureSecureUrl(logoutUrl, "/logout")
-        val body = FormBody.Builder()
-            .add("erase-cookie", "true")
-            .build()
-        val req = Request.Builder()
-            .url(secureLogout)
-            .header("Cache-Control", "no-store")
-            .header("Connection", "close")
-            .post(body)
-            .build()
+    suspend fun logout(logoutUrl: String, fallbackSession: SessionStatus?): LogoutSummary? = withContext(Dispatchers.IO) {
+        try {
+            val secureLogout = MikrotikParser.ensureSecureUrl(logoutUrl, "/logout")
+            val formBody = FormBody.Builder()
+                .add("erase-cookie", "true")
+                .build()
+            val req = Request.Builder()
+                .url(secureLogout)
+                .header("Cache-Control", "no-store")
+                .header("Connection", "close")
+                .post(formBody)
+                .build()
 
-        return@withContext try {
             client.newCall(req).execute().use { resp ->
                 val html = resp.body?.string().orEmpty()
                 client.connectionPool.evictAll()
-                if (MikrotikParser.isLogoutPageHtml(html)) {
-                    MikrotikParser.parseLogoutHtml(html, currentSession)
-                } else {
-                    LogoutSummary(
-                        username = currentSession?.username?.ifBlank { "—" } ?: "—",
-                        uptime = currentSession?.uptime ?: "—",
-                        timeLeft = currentSession?.sessionTimeLeft ?: "—",
-                        bytesIn = currentSession?.bytesIn ?: "—",
-                        bytesOut = currentSession?.bytesOut ?: "—"
-                    )
-                }
+                MikrotikParser.parseLogoutHtml(html, fallbackSession)
             }
         } catch (_: Exception) {
-            LogoutSummary(
-                username = currentSession?.username?.ifBlank { "—" } ?: "—",
-                uptime = currentSession?.uptime ?: "—",
-                timeLeft = currentSession?.sessionTimeLeft ?: "—",
-                bytesIn = currentSession?.bytesIn ?: "—",
-                bytesOut = currentSession?.bytesOut ?: "—"
-            )
+            null
         }
     }
 
     private fun fetchLoginChallengeOnly(
-        portalUrlOverride: String?,
-        httpClient: OkHttpClient = client,
-        closeConnection: Boolean = false
+        portalUrlHint: String?,
+        activeClient: OkHttpClient,
+        closeConnection: Boolean
     ): LoginChallenge? {
-        return (fetchLoginChallengeInternal(portalUrlOverride, httpClient, closeConnection)
-            as? LoginChallengeFetchResult.Challenge)?.challenge
+        val target = MikrotikParser.ensureSecureUrl(portalUrlHint, "/login")
+        return try {
+            val reqBuilder = Request.Builder()
+                .url("$target?_c=${System.currentTimeMillis()}")
+                .header("Cache-Control", "no-store")
+                .get()
+            if (closeConnection) reqBuilder.header("Connection", "close")
+            activeClient.newCall(reqBuilder.build()).execute().use { resp ->
+                val html = resp.body?.string().orEmpty()
+                if (MikrotikParser.isLoginPageHtml(html)) {
+                    MikrotikParser.parseLoginChallenge(html)
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    private fun fetchLoginChallengeInternal(
-        portalUrlOverride: String?,
-        httpClient: OkHttpClient = client,
-        closeConnection: Boolean = false
-    ): LoginChallengeFetchResult {
-        val target = MikrotikParser.ensureSecureUrl(portalUrlOverride, "/login")
-        val reqBuilder = Request.Builder()
-            .url("$target?_t=${System.currentTimeMillis()}")
-            .header("Cache-Control", "no-store")
-            .get()
-        if (closeConnection) reqBuilder.header("Connection", "close")
-        val req = reqBuilder.build()
-
-        return runCatching {
-            httpClient.newCall(req).execute().use { resp ->
-                val finalUrl = resp.request.url.toString()
+    private fun fetchLoginChallengeInternal(portalUrlHint: String?): LoginChallengeFetchResult {
+        val target = MikrotikParser.ensureSecureUrl(portalUrlHint, "/login")
+        return try {
+            val req = Request.Builder()
+                .url("$target?_c=${System.currentTimeMillis()}")
+                .header("Cache-Control", "no-store")
+                .header("Connection", "close")
+                .get()
+                .build()
+            client.newCall(req).execute().use { resp ->
                 val html = resp.body?.string().orEmpty()
-                val parsedStatus = MikrotikParser.parseStatusHtml(html)
-                if (parsedStatus != null && parsedStatus.loggedIn) {
-                    return@use LoginChallengeFetchResult.AlreadyLoggedIn(parsedStatus)
+                val status = MikrotikParser.parseStatusHtml(html)
+                if (status != null && status.loggedIn) {
+                    LoginChallengeFetchResult.AlreadyLoggedIn(status)
+                } else if (MikrotikParser.isLoginPageHtml(html)) {
+                    LoginChallengeFetchResult.Challenge(MikrotikParser.parseLoginChallenge(html))
+                } else {
+                    LoginChallengeFetchResult.Unavailable
                 }
-                if (!MikrotikParser.isLoginPageHtml(html) &&
-                    (finalUrl.contains("/status", ignoreCase = true) || MikrotikParser.isAloginPageHtml(html))
-                ) {
-                    return@use LoginChallengeFetchResult.Unavailable
-                }
-                LoginChallengeFetchResult.Challenge(MikrotikParser.parseLoginChallenge(html))
             }
-        }.getOrElse { LoginChallengeFetchResult.Unavailable }
+        } catch (_: Exception) {
+            LoginChallengeFetchResult.Unavailable
+        }
     }
 
     private fun describeNetworkException(e: IOException): String {
-        val msg = e.message.orEmpty().lowercase()
+        val msg = e.message.orEmpty()
         return when {
-            msg.contains("timeout") ->
-                "تأخر الاتصال بالشبكة. تأكد من اتصالك بشبكة الواي فاي الخاصة بالقناص ثم أعد المحاولة."
-            msg.contains("unable to resolve host") || msg.contains("unknownhost") ->
-                "تعذر الوصول إلى بوابة شبكة القناص (alqanas.cc.cd). تأكد من اتصالك بشبكة الواي فاي المحلية."
-            else ->
-                "تعذر الاتصال ببوابة الشبكة، تأكد من اتصالك بشبكة القناص وحاول مرة أخرى."
+            e is java.net.UnknownHostException -> "تعذر العثور على بوابة الشبكة (تأكد من اتصالك بواي فاي القناص)."
+            e is java.net.SocketTimeoutException -> "انتهت مهلة الاتصال ببوابة الشبكة، حاول مرة أخرى."
+            msg.contains("SSL", ignoreCase = true) || msg.contains("Cert", ignoreCase = true) ->
+                "تعذر التحقق من شهادة الأمان لبوابة الشبكة."
+            else -> "تعذر الاتصال ببوابة الشبكة، تأكد من اتصالك بشبكة القناص وحاول مرة أخرى."
         }
     }
 }
