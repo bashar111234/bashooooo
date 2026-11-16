@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">القناص نت</string>
+    <string name="brand_title">شبكة القناص</string>
+    <string name="brand_subtitle_login">بوابة تسجيل الدخول · اتصال آمن</string>
+    <string name="brand_subtitle_status">لوحة متابعة الكرت · اتصال آمن</string>
+    <string name="portal_domain">alqanas.cc.cd</string>
+    <string name="login_card_label">رقم الكرت</string>
+    <string name="login_card_placeholder">أدخل رقم الكرت</string>
+    <string name="login_submit_label">تسجيل الدخول الآن</string>
+    <string name="login_logging_in">جاري التحقق والدخول...</string>
+    <string name="saved_cards_btn">البطاقات المحفوظة</string>
+    <string name="error_no_card">الرجاء إدخال رقم الكرت أولاً</string>
+    <string name="error_no_speed">الرجاء اختيار السرعة المناسبة أولاً!</string>
+    <string name="notif_channel_name">تنبيهات رصيد شبكة القناص</string>
+    <string name="notif_channel_desc">تنبيهات مبكرة عند وصول الرصيد أو الوقت المتبقي إلى 30% و 15%</string>
+    <string name="footer_rights">شبكة القناص 2027 · جميع الروابط محمية عبر https://alqanas.cc.cd</string>
+    <string name="footer_credit">برمجة وتركيب بشار المسلمي 772432226</string>
+</resources>
