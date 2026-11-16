@@ -23,7 +23,7 @@ class NetworkSyncWorker(
     override suspend fun doWork(): Result {
         val prefs = HotspotPreferences(applicationContext)
         val remoteRepo = RemoteConfigRepository()
-        val hotspotRepo = HotspotRepository()
+        val hotspotRepo = HotspotRepository(applicationContext)
         val notifier = QuotaNotifier(applicationContext)
 
         remoteRepo.fetchConfig()
