@@ -1,5 +1,9 @@
 package com.example.data
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import com.example.model.LoginChallenge
 import com.example.model.LogoutSummary
 import com.example.model.PortalConstants
@@ -11,13 +15,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Dns
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
+import java.net.InetAddress
+import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
 
 sealed interface StatusFetchResult {
     data class Connected(val session: SessionStatus) : StatusFetchResult
@@ -31,11 +39,52 @@ sealed interface LoginAttemptResult {
     data class NetworkError(val message: String) : LoginAttemptResult
 }
 
-class HotspotRepository {
+class HotspotRepository(private val context: Context? = null) {
 
     private val cookieStore = ConcurrentHashMap<String, List<Cookie>>()
 
+    private fun findWifiNetwork(): Network? {
+        val ctx = context ?: return null
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+        @Suppress("DEPRECATION")
+        return cm.allNetworks.firstOrNull { net ->
+            val caps = cm.getNetworkCapabilities(net)
+            caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        }
+    }
+
+    private val wifiSocketFactory = object : SocketFactory() {
+        private fun activeFactory(): SocketFactory =
+            findWifiNetwork()?.socketFactory ?: getDefault()
+
+        override fun createSocket(): Socket = activeFactory().createSocket()
+        override fun createSocket(host: String?, port: Int): Socket =
+            activeFactory().createSocket(host, port)
+        override fun createSocket(host: String?, port: Int, localHost: InetAddress?, localPort: Int): Socket =
+            activeFactory().createSocket(host, port, localHost, localPort)
+        override fun createSocket(host: InetAddress?, port: Int): Socket =
+            activeFactory().createSocket(host, port)
+        override fun createSocket(address: InetAddress?, port: Int, localAddress: InetAddress?, localPort: Int): Socket =
+            activeFactory().createSocket(address, port, localAddress, localPort)
+    }
+
+    private val wifiDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            val wifi = findWifiNetwork()
+            if (wifi != null) {
+                try {
+                    val res = wifi.getAllByName(hostname)
+                    if (res.isNotEmpty()) return res.toList()
+                } catch (_: Exception) {
+                }
+            }
+            return Dns.SYSTEM.lookup(hostname)
+        }
+    }
+
     private val client: OkHttpClient = OkHttpClient.Builder()
+        .socketFactory(wifiSocketFactory)
+        .dns(wifiDns)
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
         .writeTimeout(12, TimeUnit.SECONDS)
@@ -85,6 +134,7 @@ class HotspotRepository {
 
             var apiPortalUrl: String? = null
             var apiDnsFailure: IOException? = null
+            var apiConfirmedLoggedIn = false
             try {
                 activeClient.newCall(apiReq).execute().use { resp ->
                     if (resp.isSuccessful) {
@@ -95,6 +145,8 @@ class HotspotRepository {
                             if (parsed.captive) {
                                 val loginChallenge = fetchLoginChallengeOnly(apiPortalUrl, activeClient, closeConnection)
                                 return@withContext StatusFetchResult.NotLoggedIn(loginChallenge)
+                            } else {
+                                apiConfirmedLoggedIn = true
                             }
                         }
                     }
@@ -116,30 +168,40 @@ class HotspotRepository {
             if (closeConnection) statusReqBuilder.header("Connection", "close")
             val statusReq = statusReqBuilder.build()
 
-            activeClient.newCall(statusReq).execute().use { resp ->
-                val finalUrl = resp.request.url.toString()
-                val html = resp.body?.string().orEmpty()
-                if (finalUrl.contains("/login") || (MikrotikParser.isLoginPageHtml(html) && !html.contains("window.STATUS_CONFIG"))) {
-                    return@withContext StatusFetchResult.NotLoggedIn(MikrotikParser.parseLoginChallenge(html))
+            try {
+                activeClient.newCall(statusReq).execute().use { resp ->
+                    val finalUrl = resp.request.url.toString()
+                    val html = resp.body?.string().orEmpty()
+                    if (finalUrl.contains("/login") || (MikrotikParser.isLoginPageHtml(html) && !html.contains("window.STATUS_CONFIG"))) {
+                        return@withContext StatusFetchResult.NotLoggedIn(MikrotikParser.parseLoginChallenge(html))
+                    }
+                    val parsed = MikrotikParser.parseStatusHtml(html)
+                    if (parsed != null && parsed.loggedIn) {
+                        StatusFetchResult.Connected(parsed)
+                    } else if (apiConfirmedLoggedIn) {
+                        StatusFetchResult.Connected(SessionStatus(loggedIn = true, isProvisional = true))
+                    } else {
+                        val challenge = fetchLoginChallengeOnly(apiPortalUrl, activeClient, closeConnection)
+                        StatusFetchResult.NotLoggedIn(challenge)
+                    }
                 }
-                val parsed = MikrotikParser.parseStatusHtml(html)
-                if (parsed != null && parsed.loggedIn) {
-                    StatusFetchResult.Connected(parsed)
+            } catch (e: IOException) {
+                if (apiConfirmedLoggedIn) {
+                    StatusFetchResult.Connected(SessionStatus(loggedIn = true, isProvisional = true))
                 } else {
-                    val challenge = fetchLoginChallengeOnly(apiPortalUrl, activeClient, closeConnection)
-                    StatusFetchResult.NotLoggedIn(challenge)
+                    StatusFetchResult.NetworkError(describeNetworkException(e))
                 }
             }
         } catch (e: IOException) {
             StatusFetchResult.NetworkError(describeNetworkException(e))
         } catch (e: Exception) {
-            StatusFetchResult.NetworkError("تعذر الاتصال ببوابة شبكة القناص (${e.localizedMessage ?: "خطأ غير متوقع"})")
+            StatusFetchResult.NetworkError("تعذر الاتصال ببوابة شبكة القناص (${e.javaClass.simpleName}: ${e.localizedMessage ?: "خطأ"})")
         }
     }
 
     private suspend fun fetchStatusWithRetry(
-        initialDelayMs: Long = 600L,
-        delaysMs: List<Long> = listOf(800L, 1200L, 1800L, 2500L)
+        initialDelayMs: Long = 500L,
+        delaysMs: List<Long> = listOf(700L, 1000L, 1500L, 2000L)
     ): StatusFetchResult {
         delay(initialDelayMs)
         var lastResult: StatusFetchResult = StatusFetchResult.NetworkError("تعذر الاتصال ببوابة الشبكة.")
@@ -220,14 +282,18 @@ class HotspotRepository {
                         finalUrl.contains("status", ignoreCase = true)
                 }
             } catch (e: IOException) {
-                // MikroTik frequently resets the pre-auth socket right after accepting login
                 postException = e
             }
 
             client.connectionPool.evictAll()
 
             when (val followUp = fetchStatusWithRetry()) {
-                is StatusFetchResult.Connected -> LoginAttemptResult.Success(followUp.session)
+                is StatusFetchResult.Connected -> {
+                    val s = if (followUp.session.username.isBlank()) {
+                        followUp.session.copy(username = trimmedCard)
+                    } else followUp.session
+                    LoginAttemptResult.Success(s)
+                }
                 is StatusFetchResult.NotLoggedIn -> {
                     val msg = followUp.challenge?.errorMessage
                         ?: if (postException != null) describeNetworkException(postException)
@@ -257,7 +323,7 @@ class HotspotRepository {
         } catch (e: IOException) {
             LoginAttemptResult.NetworkError(describeNetworkException(e))
         } catch (e: Exception) {
-            LoginAttemptResult.NetworkError("حدث خطأ أثناء تسجيل الدخول: ${e.localizedMessage ?: "غير معروف"}")
+            LoginAttemptResult.NetworkError("حدث خطأ أثناء تسجيل الدخول: ${e.javaClass.simpleName}: ${e.localizedMessage ?: "غير معروف"}")
         }
     }
 
@@ -265,7 +331,7 @@ class HotspotRepository {
         cardNumber: String,
         speed: SpeedProfile,
         blockUpdates: Boolean,
-        logoutUrl: String
+        logoutUrl: String?
     ): LoginAttemptResult = withContext(Dispatchers.IO) {
         try {
             val secureLogout = MikrotikParser.ensureSecureUrl(logoutUrl, "/logout")
@@ -368,7 +434,7 @@ class HotspotRepository {
             e is java.net.SocketTimeoutException -> "انتهت مهلة الاتصال ببوابة الشبكة، حاول مرة أخرى."
             msg.contains("SSL", ignoreCase = true) || msg.contains("Cert", ignoreCase = true) ->
                 "تعذر التحقق من شهادة الأمان لبوابة الشبكة."
-            else -> "تعذر الاتصال ببوابة الشبكة، تأكد من اتصالك بشبكة القناص وحاول مرة أخرى."
+            else -> "تعذر الاتصال ببوابة الشبكة (${e.javaClass.simpleName}: $msg)"
         }
     }
 }
