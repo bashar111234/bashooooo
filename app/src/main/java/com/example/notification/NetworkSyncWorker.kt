@@ -33,17 +33,24 @@ class NetworkSyncWorker(
         if (newNotifs.isNotEmpty()) {
             var maxId = lastNotifId
             for (n in newNotifs) {
-                if (n.title.isNotBlank() && n.body.isNotBlank()) {
-                    notifier.notifyAdminBroadcast(
-                        notifId = n.id,
-                        title = n.title,
-                        body = n.body,
-                        highPriority = n.highPriority
-                    )
+                if (notifier.hasNotificationPermission()) {
+            val lastNotifId = prefs.getLastAdminNotificationId()
+            val newNotifs = remoteRepo.fetchNewNotifications(afterId = lastNotifId)
+            if (newNotifs.isNotEmpty()) {
+                var maxId = lastNotifId
+                for (n in newNotifs) {
+                    if (n.title.isNotBlank() && n.body.isNotBlank()) {
+                        notifier.notifyAdminBroadcast(
+                            notifId = n.id,
+                            title = n.title,
+                            body = n.body,
+                            highPriority = n.highPriority
+                        )
+                    }
+                    if (n.id > maxId) maxId = n.id
                 }
-                if (n.id > maxId) maxId = n.id
+                prefs.setLastAdminNotificationId(maxId)
             }
-            prefs.setLastAdminNotificationId(maxId)
         }
 
         val status = hotspotRepo.fetchStatus(fastProbe = true, closeConnection = true)
