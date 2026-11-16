@@ -290,7 +290,7 @@ class HotspotRepository {
         }
     }
 
-    suspend fun logout(logoutUrl: String, fallbackSession: SessionStatus?): LogoutSummary? = withContext(Dispatchers.IO) {
+    suspend fun logout(logoutUrl: String?, fallbackSession: SessionStatus?): LogoutSummary? = withContext(Dispatchers.IO) {
         try {
             val secureLogout = MikrotikParser.ensureSecureUrl(logoutUrl, "/logout")
             val formBody = FormBody.Builder()
