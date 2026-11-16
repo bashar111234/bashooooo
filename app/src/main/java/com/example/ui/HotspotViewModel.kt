@@ -1,5 +1,6 @@
 package com.example.ui
 
+import com.example.data.RemoteConfigRepository
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
